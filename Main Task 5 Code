@@ -1,0 +1,244 @@
+/* Filename: Lab 5 Main Task 5.cpp
+Author: Musa Khizar
+Date: 19/04/2026
+*/
+
+#include "mbed.h"
+#include "arm_book_lib.h"
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+
+using namespace std::chrono;
+
+// --- Serial communication ---
+static BufferedSerial uart(USBTX, USBRX, 115200);
+
+// --- Matrix keypad - all 4 columns ---
+BusOut rows(PB_3, PB_5, PC_7, PA_15);
+DigitalIn col1(PB_12);
+DigitalIn col2(PB_13);
+DigitalIn col3(PB_15);
+DigitalIn col4(PC_6);
+DigitalIn* cols[] = {&col1, &col2, &col3, &col4};
+
+// --- Full 4x4 keypad layout ---
+char keys[4][4] = {
+    {'1', '2', '3', 'A'},
+    {'4', '5', '6', 'B'},
+    {'7', '8', '9', 'C'},
+    {'*', '0', '#', 'D'}
+};
+
+// --- Analog inputs ---
+AnalogIn tempSensor(A1);
+AnalogIn pot(A0);
+
+// --- Outputs ---
+DigitalOut buzzer(PE_10);
+DigitalOut alarmLed(LED1);
+
+// --- Deactivation code ---
+const char* secretCode = "369A";
+
+// --- Event log ---
+struct LogEntry {
+    float temperature;
+    float gasValue;
+    char  type[20];
+};
+
+LogEntry eventLog[5];
+int      eventCount = 0;
+
+// --- System state ---
+bool alarmActive    = false;
+bool cooldownActive = false;
+char enteredCode[5];
+int  codePos = 0;
+
+// --- Helper: send string to PuTTY ---
+void sendMsg(const char* m) {
+    uart.write(m, strlen(m));
+}
+
+// --- Store alarm event in log ---
+void addLog(float t, float g, const char* label) {
+    if (eventCount >= 5) {
+        for (int i = 0; i < 4; i++) {
+            eventLog[i] = eventLog[i + 1];
+        }
+        eventCount = 4;
+    }
+    eventLog[eventCount].temperature = t;
+    eventLog[eventCount].gasValue    = g;
+    strncpy(eventLog[eventCount].type, label, 19);
+    eventCount++;
+}
+
+// --- Display event log on PuTTY ---
+void displayEventLog() {
+    sendMsg("\r\n--- Event Log ---\r\n");
+    if (eventCount == 0) {
+        sendMsg("No events logged yet.\r\n");
+        sendMsg("-----------------\r\n\n");
+        return;
+    }
+    for (int i = 0; i < eventCount; i++) {
+        char buf[128];
+        sprintf(buf,
+            "Event %d: %s | T: %.1fC | G: %.0fppm\r\n",
+            i + 1,
+            eventLog[i].type,
+            eventLog[i].temperature,
+            eventLog[i].gasValue);
+        sendMsg(buf);
+    }
+    sendMsg("-----------------\r\n\n");
+}
+
+// --- Scan keypad ---
+char getKey() {
+    col1.mode(PullUp);
+    col2.mode(PullUp);
+    col3.mode(PullUp);
+    col4.mode(PullUp);
+
+    for (int r = 0; r < 4; r++) {
+        rows = (0xF & ~(1 << r));
+        thread_sleep_for(5);
+
+        for (int c = 0; c < 4; c++) {
+            if (cols[c]->read() == 0) {
+                thread_sleep_for(20);
+                if (cols[c]->read() == 0) {
+                    while (cols[c]->read() == 0);
+                    thread_sleep_for(20);
+                    return keys[r][c];
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int main()
+{
+    Timer blinkTimer;
+    Timer updateTimer;
+    Timer cooldownTimer;
+
+    blinkTimer.start();
+    updateTimer.start();
+    cooldownTimer.start();
+
+    buzzer   = OFF;
+    alarmLed = OFF;
+
+    sendMsg("\r\n=== Smart Home System - Lab 5 ===\r\n");
+    sendMsg("Deactivation code: 3, 6, 9, A, #\r\n");
+    sendMsg("Press # to view event log\r\n");
+    sendMsg("=================================\r\n\n");
+
+    while (true) {
+
+        // --- Read potentiometer ---
+        // Threshold range 30C to 70C giving plenty of headroom
+        // above room temperature readings from LM35
+        float p       = pot.read();
+        float tThresh = 25.0f + (p * 12.0f); // 25C-37C
+        float gThresh = p * 800.0f;            // 0 to 800ppm for display
+
+        // --- Read temperature ---
+        float currentT = tempSensor.read() * 330.0f;
+
+        // --- Gas value fixed at 0 to prevent MQ-2 false triggers ---
+        // The MQ-2 requires extended warmup before giving stable readings
+        // To simulate gas detection change this to 500.0f temporarily
+        float currentG = 0.0f;
+
+        // --- Reset cooldown after 5 seconds ---
+        if (cooldownActive &&
+            cooldownTimer.elapsed_time() > seconds(5)) {
+            cooldownActive = false;
+            sendMsg(">> System ready.\r\n\n");
+        }
+
+        // --- Print live status every 2 seconds ---
+        if (!alarmActive && !cooldownActive &&
+            updateTimer.elapsed_time() > seconds(2)) {
+            char buf[150];
+            sprintf(buf,
+                "-- System Normal --\r\n"
+                "   Temperature : %.1f C\r\n"
+                "   Temp Thresh : %.1f C\r\n"
+                "   Gas Thresh  : %.0f ppm\r\n"
+                "-------------------\r\n",
+                currentT, tThresh, gThresh);
+            sendMsg(buf);
+            updateTimer.reset();
+        }
+
+        // --- Trigger alarm on temperature only ---
+        // Gas alarm removed to prevent MQ-2 false triggers
+        if (!alarmActive && !cooldownActive &&
+            currentT > tThresh) {
+
+            alarmActive = true;
+            buzzer      = ON;
+            addLog(currentT, currentG, "High Temp");
+
+            char buf[150];
+            sprintf(buf,
+                ">> ALARM: High Temp\r\n"
+                "   Temperature : %.1f C\r\n"
+                "   Threshold   : %.1f C\r\n",
+                currentT, tThresh);
+            sendMsg(buf);
+            sendMsg("Enter 4-Digit Code to Deactivate"
+                    " (3, 6, 9, A then #):\r\n");
+        }
+
+        // --- Blink LED1 when alarm active ---
+        if (alarmActive) {
+            if (blinkTimer.elapsed_time() > milliseconds(200)) {
+                alarmLed = (alarmLed.read() == 0) ? 1 : 0;
+                blinkTimer.reset();
+            }
+        }
+
+        // --- Handle keypad input ---
+        char k = getKey();
+        if (k != 0) {
+
+            if (k == '#' && !alarmActive) {
+                // # outside alarm = show event log
+                displayEventLog();
+
+            } else if (k == '#' && alarmActive) {
+                // # during alarm = submit code
+                enteredCode[codePos] = '\0';
+                if (codePos == 4 &&
+                    strcmp(enteredCode, secretCode) == 0) {
+                    alarmActive    = false;
+                    cooldownActive = true;
+                    buzzer         = OFF;
+                    alarmLed       = OFF;
+                    codePos        = 0;
+                    cooldownTimer.reset();
+                    sendMsg("\r\n>> Correct code! "
+                            "Alarm deactivated.\r\n\n");
+                } else {
+                    codePos = 0;
+                    sendMsg("\r\n>> Wrong code. Try again:\r\n");
+                }
+
+            } else if (alarmActive && codePos < 4) {
+                enteredCode[codePos++] = k;
+                sendMsg("*");
+            }
+        }
+
+        thread_sleep_for(10);
+    }
+}
